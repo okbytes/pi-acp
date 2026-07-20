@@ -295,6 +295,11 @@ export class PiAcpSession {
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
 
+  // Serialize `get_session_stats` round-trips used to emit ACP `usage_update`
+  // notifications (context window + cost), so overlapping turn_end/agent_end
+  // events never deliver stale results out of order.
+  private usageChain: Promise<void> = Promise.resolve()
+
   constructor(opts: {
     sessionId: string
     cwd: string
@@ -414,6 +419,24 @@ export class PiAcpSession {
 
   private async flushEmits(): Promise<void> {
     await this.lastEmit
+  }
+
+  /**
+   * Query pi for the current context-window usage + cost and forward it to the
+   * client as an ACP `usage_update` (drives Zed's context meter and cost display).
+   * Best-effort and non-blocking: failures and missing data are ignored, and
+   * calls are serialized so results are delivered in order.
+   */
+  private emitUsageUpdate(): void {
+    this.usageChain = this.usageChain
+      .then(async () => {
+        const stats = await this.proc.getSessionStats().catch(() => null)
+        const update = toUsageUpdate(stats)
+        if (update) this.emit(update)
+      })
+      .catch(() => {
+        // Ignore; a later turn_end/agent_end will retry.
+      })
   }
 
   private emitBashToolCall(params: {
@@ -825,12 +848,16 @@ export class PiAcpSession {
       case 'turn_end': {
         // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.
         // Do NOT resolve the ACP `session/prompt` here; wait for `agent_end`.
+        // Emit a fresh context/cost snapshot so clients can track usage mid-turn.
+        this.emitUsageUpdate()
         break
       }
 
       case 'agent_end': {
         // Ensure all updates derived from pi events are delivered before we resolve
         // the ACP `session/prompt` request.
+        // Emit the final context/cost snapshot for this prompt.
+        this.emitUsageUpdate()
         void this.flushEmits().finally(() => {
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
           this.pendingTurn?.resolve(reason)
@@ -1008,6 +1035,36 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
 
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
+}
+
+/**
+ * Map pi's `get_session_stats` response to an ACP `usage_update` session update.
+ * Returns null when pi hasn't reported a usable context-window estimate yet
+ * (e.g. no model/context window available, or right after compaction before a
+ * fresh assistant response provides valid usage data).
+ */
+function toUsageUpdate(stats: unknown): SessionUpdate | null {
+  const s = stats as
+    | {
+        cost?: unknown
+        contextUsage?: { tokens?: unknown; contextWindow?: unknown } | null
+      }
+    | null
+    | undefined
+
+  const ctx = s?.contextUsage
+  const used = typeof ctx?.tokens === 'number' ? ctx.tokens : null
+  const size = typeof ctx?.contextWindow === 'number' ? ctx.contextWindow : null
+  if (used === null || size === null || size <= 0) return null
+
+  const costAmount = typeof s?.cost === 'number' ? s.cost : null
+
+  return {
+    sessionUpdate: 'usage_update',
+    used,
+    size,
+    ...(costAmount !== null ? { cost: { amount: costAmount, currency: 'USD' } } : {})
+  }
 }
 
 function toToolKind(toolName: string): ToolKind {

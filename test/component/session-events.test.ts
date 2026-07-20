@@ -268,6 +268,130 @@ test('PiAcpSession: cancels unsupported input and editor extension UI requests w
   assert.match((conn.updates[1]!.update as any).content.text, /editor UI request is not supported/)
 })
 
+test('PiAcpSession: emits usage_update with context + cost on turn_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.nextSessionStats = {
+    cost: 0.42,
+    contextUsage: { tokens: 60000, contextWindow: 200000, percent: 30 }
+  }
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'turn_end' } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+
+  const usage = conn.updates.filter(u => u.update.sessionUpdate === 'usage_update')
+  assert.equal(usage.length, 1)
+  assert.deepEqual(usage[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 60000,
+    size: 200000,
+    cost: { amount: 0.42, currency: 'USD' }
+  })
+})
+
+test('PiAcpSession: usage_update omits cost when pi reports no cost', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.nextSessionStats = {
+    contextUsage: { tokens: 1200, contextWindow: 200000, percent: 1 }
+  }
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'turn_end' } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+
+  const usage = conn.updates.filter(u => u.update.sessionUpdate === 'usage_update')
+  assert.equal(usage.length, 1)
+  assert.deepEqual(usage[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 1200,
+    size: 200000
+  })
+})
+
+test('PiAcpSession: skips usage_update when context estimate is unavailable (e.g. post-compaction)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.nextSessionStats = {
+    cost: 0.1,
+    contextUsage: { tokens: null, contextWindow: 200000, percent: null }
+  }
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'turn_end' } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+
+  const usage = conn.updates.filter(u => u.update.sessionUpdate === 'usage_update')
+  assert.equal(usage.length, 0)
+})
+
+test('PiAcpSession: emits a final usage_update on agent_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.nextSessionStats = {
+    cost: 1.5,
+    contextUsage: { tokens: 90000, contextWindow: 200000, percent: 45 }
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_end' })
+  const reason = await p
+  assert.equal(reason, 'end_turn')
+
+  await new Promise(r => setTimeout(r, 0))
+  await new Promise(r => setTimeout(r, 0))
+
+  const usage = conn.updates.filter(u => u.update.sessionUpdate === 'usage_update')
+  assert.equal(usage.length, 1)
+  assert.deepEqual(usage[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 90000,
+    size: 200000,
+    cost: { amount: 1.5, currency: 'USD' }
+  })
+})
+
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
