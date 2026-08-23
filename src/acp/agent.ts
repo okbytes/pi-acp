@@ -42,7 +42,7 @@ import {
 } from './translate/bash.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
-import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
+import { getAcpModelFilter, getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
@@ -60,6 +60,15 @@ type AdvertisedModel = {
 
 const MODEL_CONFIG_ID = 'model'
 const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
+
+const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
+  off: 'Off',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'X-High'
+}
 
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -348,7 +357,8 @@ export class PiAcpAgent implements ACPAgent {
 
     const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
       state,
-      availableModels
+      availableModels,
+      cwd: params.cwd
     })
 
     const quietStartup = getQuietStartup(params.cwd)
@@ -396,6 +406,8 @@ export class PiAcpAgent implements ACPAgent {
     // Important: some clients (e.g. Zed) will ignore notifications for an unknown sessionId.
     // So we must send this *after* the session/new response has been delivered.
     setTimeout(() => {
+      // Same reason: seed the context/cost readout only once the client knows the session.
+      void session.emitUsageUpdate?.()
       void (async () => {
         try {
           const pi = (await session.proc.getCommands()) as any
@@ -463,6 +475,8 @@ export class PiAcpAgent implements ACPAgent {
         ].filter(Boolean)
 
         const text = headerLines.join('\n') + (summary ? `\n\n${summary}` : '')
+
+        void session.emitUsageUpdate()
 
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
@@ -1060,7 +1074,7 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(proc)
+    const { configOptions, models, modes } = await getSessionConfiguration(proc, { cwd: params.cwd })
 
     const response = {
       configOptions,
@@ -1075,6 +1089,8 @@ export class PiAcpAgent implements ACPAgent {
 
     // Advertise slash commands after the response so the client knows the session exists.
     setTimeout(() => {
+      // Seed the context/cost readout for the restored transcript.
+      void session.emitUsageUpdate?.()
       void (async () => {
         try {
           const pi = (await proc.getCommands()) as any
@@ -1137,7 +1153,8 @@ export class PiAcpAgent implements ACPAgent {
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
     const session = await this.restoreSession(params.sessionId)
     await setSessionModel(session.proc, params.modelId)
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    void session.emitUsageUpdate?.()
+    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, session.cwd)
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1159,7 +1176,7 @@ export class PiAcpAgent implements ACPAgent {
       }
     })
 
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, session.cwd)
 
     return {}
   }
@@ -1174,6 +1191,8 @@ export class PiAcpAgent implements ACPAgent {
 
     if (configId === MODEL_CONFIG_ID) {
       await setSessionModel(session.proc, params.value)
+      // The context window is model-specific, so refresh the usage readout too.
+      void session.emitUsageUpdate?.()
     } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
       if (!isThinkingLevel(params.value)) {
         throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
@@ -1192,7 +1211,7 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`Unknown config option: ${configId}`)
     }
 
-    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, session.cwd)
     return { configOptions }
   }
 }
@@ -1234,7 +1253,9 @@ async function getThinkingState(
     currentModeId: current,
     availableModes: available.map(id => ({
       id,
-      name: `Thinking: ${id}`,
+      // Keep it tight: Zed renders the *selected option's* name in the config bar,
+      // and the select itself is already labelled "Thinking".
+      name: THINKING_LEVEL_LABELS[id],
       description: null
     }))
   }
@@ -1242,7 +1263,7 @@ async function getThinkingState(
 
 async function getSessionConfiguration(
   proc: PiRpcProcess,
-  pre?: { state?: any | null; availableModels?: any | null }
+  pre?: { state?: any | null; availableModels?: any | null; cwd?: string }
 ): Promise<{
   configOptions: SessionConfigOption[]
   models: {
@@ -1318,7 +1339,7 @@ function buildConfigOptions(state: {
 
 async function getModelState(
   proc: PiRpcProcess,
-  pre?: { state?: any | null; availableModels?: any | null }
+  pre?: { state?: any | null; availableModels?: any | null; cwd?: string }
 ): Promise<{
   availableModels: AdvertisedModel[]
   currentModelId: string
@@ -1337,20 +1358,19 @@ async function getModelState(
     })())
 
   const models: any[] = Array.isArray(data?.models) ? data.models : []
-  availableModels = models
+
+  type RawModel = { provider: string; id: string; name: string; contextWindow: number | null }
+
+  const raw: RawModel[] = models
     .map(m => {
       const provider = String(m?.provider ?? '').trim()
       const id = String(m?.id ?? '').trim()
       if (!provider || !id) return null
 
-      const name = String(m?.name ?? id)
-      return {
-        modelId: `${provider}/${id}`,
-        name: `${provider}/${name}`,
-        description: null
-      } satisfies AdvertisedModel
+      const contextWindow = typeof m?.contextWindow === 'number' && m.contextWindow > 0 ? m.contextWindow : null
+      return { provider, id, name: String(m?.name ?? id).trim() || id, contextWindow }
     })
-    .filter(Boolean) as AdvertisedModel[]
+    .filter(Boolean) as RawModel[]
 
   // Ask pi what model is currently active.
   let currentModelId: string | null = null
@@ -1372,6 +1392,28 @@ async function getModelState(
     if (provider && id) currentModelId = `${provider}/${id}`
   }
 
+  // Hide models the user never wants to see (e.g. `"acp": { "hideModels": ["google-vertex/*"] }`),
+  // but never hide the model that is actually selected or the picker would render blank.
+  const filter = getAcpModelFilter(pre?.cwd ?? process.cwd())
+  const visible = raw.filter(m => `${m.provider}/${m.id}` === currentModelId || isModelVisible(m, filter))
+
+  // Only prefix the provider when two visible models would otherwise render identically.
+  const labelCounts = new Map<string, number>()
+  for (const m of visible) labelCounts.set(m.name, (labelCounts.get(m.name) ?? 0) + 1)
+
+  availableModels = visible.map(m => {
+    const ctx = formatContextWindow(m.contextWindow)
+    const ambiguous = (labelCounts.get(m.name) ?? 0) > 1
+    const base = ambiguous ? `${m.name} · ${m.provider}` : m.name
+    // Avoid "Claude Haiku 4.5 (latest) (200k context)" for names that already end in parens.
+    const label = !ctx ? base : base.endsWith(')') ? `${base} · ${ctx} context` : `${base} (${ctx} context)`
+    return {
+      modelId: `${m.provider}/${m.id}`,
+      name: label,
+      description: `${m.provider}/${m.id}`
+    } satisfies AdvertisedModel
+  })
+
   if (!availableModels.length && !currentModelId) return null
 
   // Fallback if current model is unknown: use first in list.
@@ -1383,12 +1425,47 @@ async function getModelState(
   }
 }
 
+function formatContextWindow(tokens: number | null): string | null {
+  if (!tokens || !Number.isFinite(tokens) || tokens <= 0) return null
+  if (tokens >= 1_000_000) {
+    const m = Math.round((tokens / 1_000_000) * 10) / 10
+    return `${m}M`
+  }
+  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}k`
+  return String(tokens)
+}
+
+function globToRegExp(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.')
+  return new RegExp(`^${escaped}$`, 'i')
+}
+
+function isModelVisible(
+  m: { provider: string; id: string; name: string },
+  filter: { hide: string[]; show: string[] }
+): boolean {
+  const candidates = [`${m.provider}/${m.id}`, m.id, m.provider, m.name]
+  const matches = (pattern: string) => {
+    const re = globToRegExp(pattern.trim())
+    return candidates.some(c => re.test(c))
+  }
+
+  // Allowlist wins when present: only models matching `showModels` survive.
+  if (filter.show.length && !filter.show.some(matches)) return false
+  if (filter.hide.some(matches)) return false
+  return true
+}
+
 async function emitConfigOptionsUpdate(
   conn: AgentSideConnection,
   sessionId: string,
-  proc: PiRpcProcess
+  proc: PiRpcProcess,
+  cwd?: string
 ): Promise<SessionConfigOption[]> {
-  const { configOptions } = await getSessionConfiguration(proc)
+  const { configOptions } = await getSessionConfiguration(proc, { cwd })
 
   await conn.sessionUpdate({
     sessionId,

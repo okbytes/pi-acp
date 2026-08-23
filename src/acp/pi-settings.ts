@@ -57,6 +57,42 @@ export function getEnableSkillCommands(cwd: string): boolean {
   return true
 }
 
+export type AcpModelFilter = {
+  hide: string[]
+  show: string[]
+}
+
+function toPatternList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+  if (typeof value === 'string')
+    return value
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+  return []
+}
+
+/**
+ * Model visibility filter for the ACP model picker.
+ *
+ * Sources (merged, later wins for env):
+ *   ~/.pi/agent/settings.json / <cwd>/.pi/settings.json:
+ *     { "acp": { "hideModels": ["google-vertex/*"], "showModels": [] } }
+ *   env: PI_ACP_HIDE_MODELS="google-vertex/*,*gemini*"  PI_ACP_SHOW_MODELS="anthropic-vertex/*"
+ *
+ * Patterns are case-insensitive globs (`*` = any run of characters) matched against
+ * "provider/id", the bare id, the bare provider, and the human model name.
+ */
+export function getAcpModelFilter(cwd: string): AcpModelFilter {
+  const merged = getMergedSettings(cwd)
+  const acp = isObject(merged.acp) ? merged.acp : {}
+
+  const hide = [...toPatternList(acp.hideModels), ...toPatternList(process.env.PI_ACP_HIDE_MODELS)]
+  const show = [...toPatternList(acp.showModels), ...toPatternList(process.env.PI_ACP_SHOW_MODELS)]
+
+  return { hide, show }
+}
+
 /**
  * Mirror pi's quietStartup setting: if true, pi suppresses the verbose startup prelude.
  * We use it to decide whether to synthesize + emit our own "startup info" message.

@@ -325,6 +325,10 @@ export class PiAcpSession {
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
 
+  // Context-window / cost readout (ACP `usage_update`). pi emits many `turn_end`s per
+  // prompt, so mid-turn refreshes are throttled; settle/compaction always refresh.
+  private lastUsageEmitAt = 0
+  private usageInFlight = false
 
   constructor(opts: {
     sessionId: string
@@ -445,6 +449,44 @@ export class PiAcpSession {
 
   private async flushEmits(): Promise<void> {
     await this.lastEmit
+  }
+
+  /**
+   * Push the context-window + cost readout Zed renders next to the model picker.
+   * Source of truth is pi's `get_session_stats` (`contextUsage` mirrors what pi's own
+   * footer shows and what auto-compaction keys off).
+   */
+  async emitUsageUpdate(opts?: { minIntervalMs?: number }): Promise<void> {
+    const minInterval = opts?.minIntervalMs ?? 0
+    const now = Date.now()
+    if (this.usageInFlight) return
+    if (minInterval > 0 && now - this.lastUsageEmitAt < minInterval) return
+
+    this.usageInFlight = true
+    try {
+      const stats = (await this.proc.getSessionStats()) as any
+      const ctx = stats?.contextUsage
+
+      const size = typeof ctx?.contextWindow === 'number' && ctx.contextWindow > 0 ? ctx.contextWindow : null
+      // `tokens` is null right after compaction until a fresh assistant response lands.
+      const used = typeof ctx?.tokens === 'number' && ctx.tokens >= 0 ? ctx.tokens : null
+      if (size === null || used === null) return
+
+      const cost = typeof stats?.cost === 'number' && Number.isFinite(stats.cost) ? stats.cost : null
+
+      this.lastUsageEmitAt = Date.now()
+      this.emit({
+        sessionUpdate: 'usage_update',
+        // ACP types these as uint64; pi's estimate can be fractional.
+        used: Math.max(0, Math.round(used)),
+        size: Math.round(size),
+        ...(cost !== null ? { cost: { amount: cost, currency: 'USD' } } : {})
+      })
+    } catch {
+      // Usage is decorative; never fail a turn over it.
+    } finally {
+      this.usageInFlight = false
+    }
   }
 
   private emitBashToolCall(params: {
@@ -937,6 +979,7 @@ export class PiAcpSession {
             text: 'Automatic compaction finished; context was summarized to continue the session.'
           } satisfies ContentBlock
         })
+        void this.emitUsageUpdate()
         break
       }
 
@@ -953,6 +996,8 @@ export class PiAcpSession {
       case 'turn_end': {
         // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.
         // Do NOT resolve the ACP `session/prompt` here; wait for `agent_settled`.
+        // Refresh the context/cost readout as the turn progresses (throttled).
+        void this.emitUsageUpdate({ minIntervalMs: 2000 })
         break
       }
 
@@ -965,27 +1010,30 @@ export class PiAcpSession {
 
       case 'agent_settled': {
         // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
+        // the ACP `session/prompt` request. Final usage numbers go out first so the
+        // readout is accurate the moment the composer unlocks.
+        void this.emitUsageUpdate().finally(() => {
+          void this.flushEmits().finally(() => {
+            const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+            this.pendingTurn?.resolve(reason)
+            this.pendingTurn = null
+            this.inAgentLoop = false
 
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
+            // Start next queued prompt, if any.
+            const next = this.turnQueue.shift()
+            if (next) {
+              this.emit({
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+              })
+              this.startTurn(next)
+            } else {
+              this.emit({
+                sessionUpdate: 'session_info_update',
+                _meta: { piAcp: { queueDepth: 0, running: false } }
+              })
+            }
+          })
         })
         break
       }

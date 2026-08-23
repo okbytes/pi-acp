@@ -36,7 +36,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         async getAvailableModels() {
           return {
             models: [
-              { provider: 'test', id: 'alpha', name: 'Alpha' },
+              { provider: 'test', id: 'alpha', name: 'Alpha', contextWindow: 200000 },
               { provider: 'test', id: 'beta', name: 'Beta' }
             ]
           }
@@ -49,7 +49,8 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         }
       },
       setStartupInfo() {},
-      sendStartupInfoIfPending() {}
+      sendStartupInfoIfPending() {},
+      emitUsageUpdate() {}
     }
 
     const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
@@ -68,8 +69,8 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         description: 'Select the model for this session',
         currentValue: 'test/beta',
         options: [
-          { value: 'test/alpha', name: 'test/Alpha', description: null },
-          { value: 'test/beta', name: 'test/Beta', description: null }
+          { value: 'test/alpha', name: 'Alpha (200k context)', description: 'test/alpha' },
+          { value: 'test/beta', name: 'Beta', description: 'test/beta' }
         ]
       },
       {
@@ -80,12 +81,12 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         description: 'Set the reasoning effort for this session',
         currentValue: 'high',
         options: [
-          { value: 'off', name: 'Thinking: off', description: null },
-          { value: 'minimal', name: 'Thinking: minimal', description: null },
-          { value: 'low', name: 'Thinking: low', description: null },
-          { value: 'medium', name: 'Thinking: medium', description: null },
-          { value: 'high', name: 'Thinking: high', description: null },
-          { value: 'xhigh', name: 'Thinking: xhigh', description: null }
+          { value: 'off', name: 'Off', description: null },
+          { value: 'minimal', name: 'Minimal', description: null },
+          { value: 'low', name: 'Low', description: null },
+          { value: 'medium', name: 'Medium', description: null },
+          { value: 'high', name: 'High', description: null },
+          { value: 'xhigh', name: 'X-High', description: null }
         ]
       }
     ])
