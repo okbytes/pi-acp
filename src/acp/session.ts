@@ -27,6 +27,12 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import {
+  appendStreamedToolInput,
+  createStreamedToolInput,
+  recoverStreamedToolInput,
+  type StreamedToolInput
+} from './translate/streamed-tool-input.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -52,6 +58,15 @@ type QueuedTurn = {
 
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
 
+/**
+ * Bytes of streamed arguments before a tool call gets a placeholder card.
+ * Small calls (a bash command, an edit of a few lines) complete in well under a
+ * second, so opening early would only replace their real card with a nameless
+ * one; the wait worth covering is a model writing a whole file into `content`.
+ */
+const STREAMED_TOOL_CALL_MIN_BYTES = 512
+const STREAMED_TOOL_CALL_TITLE = 'Preparing tool call…'
+
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
   { optionId: 'no', name: 'No', kind: 'reject_once' }
@@ -73,6 +88,11 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
     if (text.charCodeAt(i) === 10) line += 1
   }
   return line
+}
+
+function contentIndexOf(assistantMessageEvent: unknown): number {
+  const index = (assistantMessageEvent as { contentIndex?: unknown } | null | undefined)?.contentIndex
+  return typeof index === 'number' ? index : 0
 }
 
 function getToolPath(args: unknown): string | undefined {
@@ -292,9 +312,19 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
 
+  // Arguments still streaming, keyed by the `contentIndex` pi reports (the only
+  // handle its `toolcall_start`/`toolcall_delta` events carry). Cleared per
+  // assistant message.
+  private streamedToolInputs = new Map<number, StreamedToolInput>()
+  // pi tool call id -> the ACP tool call id its card was opened under. Only
+  // populated for calls surfaced while their arguments streamed.
+  private streamedToolCallIds = new Map<string, string>()
+  private streamedToolCallSeq = 0
+
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
+
 
   constructor(opts: {
     sessionId: string
@@ -463,6 +493,69 @@ export class PiAcpSession {
     })
   }
 
+  /**
+   * Map a pi tool call id to the ACP id its card lives under: they differ when
+   * the call was surfaced while its arguments streamed, since pi withholds its
+   * id until `toolcall_end`.
+   */
+  private acpToolCallId(piToolCallId: string): string {
+    return this.streamedToolCallIds.get(piToolCallId) ?? piToolCallId
+  }
+
+  private handleStreamedToolInputDelta(contentIndex: number, delta: string): void {
+    const state = this.streamedToolInputs.get(contentIndex)
+    if (!state || state.complete) return
+
+    appendStreamedToolInput(state, delta)
+
+    if (!state.opened) {
+      // Recovering only once opened means this first call yields every field
+      // completed so far, not just the one that landed with this delta.
+      if (state.complete || state.partialJson.length < STREAMED_TOOL_CALL_MIN_BYTES) return
+
+      const recovered = recoverStreamedToolInput(state)
+      state.opened = true
+      this.currentToolCalls.set(state.toolCallId, 'pending')
+      this.emit({
+        sessionUpdate: 'tool_call',
+        toolCallId: state.toolCallId,
+        title: STREAMED_TOOL_CALL_TITLE,
+        kind: 'other',
+        status: 'pending',
+        ...(recovered ? { locations: toToolCallLocations(recovered, this.cwd), rawInput: recovered } : {})
+      })
+      return
+    }
+
+    const recovered = recoverStreamedToolInput(state)
+    if (!recovered) return
+
+    this.emit({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: state.toolCallId,
+      status: this.currentToolCalls.get(state.toolCallId) ?? 'pending',
+      locations: toToolCallLocations(recovered, this.cwd),
+      rawInput: recovered
+    })
+  }
+
+  /**
+   * Tool calls whose arguments were still streaming when the assistant message
+   * ended never reach `toolcall_end` (the model was interrupted, or the turn
+   * errored), so their cards would spin forever.
+   */
+  private abandonStreamedToolInputs(): void {
+    if (!this.streamedToolInputs.size) return
+
+    for (const [, state] of this.streamedToolInputs) {
+      if (!state.opened) continue
+      this.emit({ sessionUpdate: 'tool_call_update', toolCallId: state.toolCallId, status: 'failed' })
+      this.cleanupToolCall(state.toolCallId)
+    }
+
+    this.streamedToolInputs.clear()
+  }
+
   private cleanupToolCall(toolCallId: string): void {
     this.currentToolCalls.delete(toolCallId)
     this.fileSnapshots.delete(toolCallId)
@@ -537,17 +630,37 @@ export class PiAcpSession {
           break
         }
 
-        // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
-        // while the model is still streaming tool call args.
-        if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
+        if (ame?.type === 'toolcall_start') {
+          this.streamedToolInputs.set(
+            contentIndexOf(ame),
+            createStreamedToolInput(`pi-stream-${(this.streamedToolCallSeq += 1)}`)
+          )
+          break
+        }
+
+        // Surface long tool calls while their arguments are still streaming:
+        // pi sends no id or name until `toolcall_end`, so the card is opened
+        // under an id we mint and refined as complete fields land.
+        if (ame?.type === 'toolcall_delta') {
+          this.handleStreamedToolInputDelta(contentIndexOf(ame), typeof ame.delta === 'string' ? ame.delta : '')
+          break
+        }
+
+        if (ame?.type === 'toolcall_end') {
           const toolCall =
             // pi sometimes includes the tool call directly on the event
             (ame as any)?.toolCall ??
             // ...and always includes it in the partial assistant message at contentIndex
-            (ame as any)?.partial?.content?.[(ame as any)?.contentIndex ?? 0]
+            (ame as any)?.partial?.content?.[contentIndexOf(ame)]
 
-          const toolCallId = String((toolCall as any)?.id ?? '')
+          const streamed = this.streamedToolInputs.get(contentIndexOf(ame))
+          this.streamedToolInputs.delete(contentIndexOf(ame))
+
+          const piToolCallId = String((toolCall as any)?.id ?? '')
           const toolName = String((toolCall as any)?.name ?? 'tool')
+
+          if (piToolCallId && streamed?.opened) this.streamedToolCallIds.set(piToolCallId, streamed.toolCallId)
+          const toolCallId = streamed?.opened ? streamed.toolCallId : piToolCallId
 
           if (toolCallId) {
             const rawInput =
@@ -577,7 +690,10 @@ export class PiAcpSession {
                 args: rawInput,
                 status,
                 locations,
-                includeTerminal: !existingStatus
+                // Terminal content goes out the first time we know the call is
+                // bash, which for a streamed card is this update rather than
+                // the `tool_call` that opened it.
+                includeTerminal: !this.bashToolCallIds.has(toolCallId)
               })
             } else if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, 'pending')
@@ -591,11 +707,14 @@ export class PiAcpSession {
                 rawInput
               })
             } else {
-              // Best-effort: keep rawInput updated while args are streaming.
-              // Keep the existing status (pending or in_progress).
+              // A card is already open (streamed placeholder, or a tool call pi
+              // started executing before this event). Name it now that pi has
+              // told us which tool it is.
               this.emit({
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
+                title: toolName,
+                kind: toToolKind(toolName),
                 status,
                 locations,
                 rawInput
@@ -611,7 +730,7 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_start': {
-        const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
+        const toolCallId = this.acpToolCallId(String((ev as any).toolCallId ?? crypto.randomUUID()))
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
         let line: number | undefined
@@ -686,8 +805,9 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_update': {
-        const toolCallId = String((ev as any).toolCallId ?? '')
-        if (!toolCallId) break
+        const piToolCallId = String((ev as any).toolCallId ?? '')
+        if (!piToolCallId) break
+        const toolCallId = this.acpToolCallId(piToolCallId)
 
         const partial = (ev as any).partialResult
         if (this.bashToolCallIds.has(toolCallId)) {
@@ -710,8 +830,10 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_end': {
-        const toolCallId = String((ev as any).toolCallId ?? '')
-        if (!toolCallId) break
+        const piToolCallId = String((ev as any).toolCallId ?? '')
+        if (!piToolCallId) break
+        const toolCallId = this.acpToolCallId(piToolCallId)
+        this.streamedToolCallIds.delete(piToolCallId)
 
         const result = (ev as any).result
         const isError = Boolean((ev as any).isError)
@@ -815,6 +937,11 @@ export class PiAcpSession {
             text: 'Automatic compaction finished; context was summarized to continue the session.'
           } satisfies ContentBlock
         })
+        break
+      }
+
+      case 'message_end': {
+        this.abandonStreamedToolInputs()
         break
       }
 

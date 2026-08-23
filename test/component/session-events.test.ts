@@ -491,14 +491,15 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
 
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: {
-      type: 'toolcall_start',
-      toolCall: {
-        id: 't1',
-        name: 'write',
-        arguments: { path: '/tmp/test.txt', content: 'hello' }
-      }
-    }
+    assistantMessageEvent: { type: 'toolcall_start', contentIndex: 0 }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: '{"path": "/tmp/test.txt", "content": "' }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: 'x'.repeat(600) }
   })
 
   await new Promise(r => setTimeout(r, 0))
