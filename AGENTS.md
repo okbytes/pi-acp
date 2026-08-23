@@ -69,11 +69,89 @@ For real validation, test with an ACP client (e.g. Zed external agent).
 
 - **DO NOT** commit unless explicitly asked!
 
+## This checkout is a patched fork
+
+This working copy is **`okbytes/pi-acp`**, a fork of `svkozak/pi-acp` kept patched for daily
+use in Zed. It is a _consumer_ fork, not a contributor fork, so the convention is inverted
+from the usual advice:
+
+- **`main` is the patched line that Zed actually runs.** Local fixes land as ordinary commits
+  on `main`. There is no "which branch is the real one?" question.
+- Upstream is a remote, not a branch to defend.
+
+```
+origin    git@github.com:okbytes/pi-acp.git     # ours; main tracks this
+upstream  https://github.com/svkozak/pi-acp.git # svkozak's
+```
+
+Because `main` intentionally diverges from upstream, GitHub's "Sync fork" button does not
+apply — sync by rebasing from the CLI (below). `archive/*` branches are parked experiments;
+leave them alone.
+
+### Daily loop
+
+```bash
+npm test && npm run build   # dist/ is what Zed executes and is gitignored
+git add -A && git commit -m "fix(acp): ..."
+git push                    # -> origin (okbytes)
+```
+
+Restart the Zed thread after a build: the agent process starts once per thread and will not
+pick up a new `dist/index.js` otherwise.
+
+### Pulling in upstream work
+
+```bash
+git fetch upstream
+git rebase upstream/main    # replays local patches on top of svkozak's main
+npm test && npm run build
+git push --force-with-lease # rebase rewrote local commits; expected, and safe (sole pusher)
+```
+
+Keep local patches as **small, single-purpose commits**. That is what makes this rebase cheap
+and lets any one of them be dropped when upstream fixes the same thing.
+
+### Contributing a patch upstream
+
+Cut a topic branch from upstream and cherry-pick, so the PR carries only that change:
+
+```bash
+git switch -c fix/whatever upstream/main
+git cherry-pick <sha>
+git push -u origin fix/whatever
+gh pr create --repo svkozak/pi-acp --head okbytes:fix/whatever
+```
+
+### Local patches currently carried
+
+- **Streamed tool cards** — open a tool call card while its arguments are still streaming, since
+  pi withholds the call's id/name until `toolcall_end` (`src/acp/translate/streamed-tool-input.ts`,
+  plus the `message_update` handling in `src/acp/session.ts`).
+- **Context/cost readout** — emit ACP `usage_update` from pi's `get_session_stats`
+  (`Session.emitUsageUpdate` in `src/acp/session.ts`).
+- **Compact config bar + model filtering** — model/thinking labels and
+  `acp.hideModels`/`acp.showModels` + `PI_ACP_HIDE_MODELS`/`PI_ACP_SHOW_MODELS`
+  (`buildConfigOptions`/`getModelState` in `src/acp/agent.ts`, `getAcpModelFilter` in
+  `src/acp/pi-settings.ts`).
+
+Rebase conflicts, when they happen, are almost always in `getModelState`/`buildConfigOptions`
+in `src/acp/agent.ts` or the pi-event `switch` in `src/acp/session.ts` — the same two hot spots
+upstream edits.
+
 ## Client information
 
 - Current ACP client is Zed
+- Zed launches this checkout directly: `"agent_servers": { "pi-acp": { "command": "node",
+"args": ["/Users/brett/code/pi-acp/dist/index.js" ] } }` in `~/.config/zed/settings.json`,
+  which is chezmoi-managed (`~/.local/share/chezmoi/dot_config/zed/private_settings.json.tmpl`).
+  Edit the chezmoi source and `chezmoi apply`, never the generated file.
 
 ## References
 
-- Local ACP repo with protocol documentation and specs: `~/Dev/learning/agent-client-protocol`
-- Local Zed repo `~/Dev/learning/zed/zed`
+- ACP TypeScript SDK types/schema (authoritative for what a client will accept):
+  `node_modules/@agentclientprotocol/sdk/schema/schema.json` and `dist/schema/types.gen.d.ts`
+- pi's RPC command/response reference (authoritative for the pi side): `docs/rpc.md` inside the
+  installed `@earendil-works/pi-coding-agent` package
+- Reference implementation of a mature ACP adapter: `~/code/claude-agent-acp`
+- Upstream-author paths (may not exist on this machine): `~/Dev/learning/agent-client-protocol`,
+  `~/Dev/learning/zed/zed`
