@@ -94,6 +94,27 @@ export function getAcpModelFilter(cwd: string): AcpModelFilter {
 }
 
 /**
+ * Opt-in "New version available" notice.
+ *
+ * Off by default: npm publishes the new version before the local install command can fetch it,
+ * so the notice fires on sessions where updating is not yet possible, and emitting it as the first
+ * agent message pins Zed's thread title to "New Agent Thread".
+ *
+ * Sources:
+ *   ~/.pi/agent/settings.json / <cwd>/.pi/settings.json: { "acp": { "updateNotice": true } }
+ *   env: PI_ACP_UPDATE_NOTICE=true
+ */
+export function getUpdateNoticeEnabled(cwd: string): boolean {
+  const env = process.env.PI_ACP_UPDATE_NOTICE
+  if (typeof env === 'string' && env.trim().length > 0) return env.trim().toLowerCase() === 'true'
+
+  const merged = getMergedSettings(cwd)
+  const acp = isObject(merged.acp) ? merged.acp : {}
+
+  return acp.updateNotice === true
+}
+
+/**
  * Mirror pi's quietStartup setting: if true, pi suppresses the verbose startup prelude.
  * We use it to decide whether to synthesize + emit our own "startup info" message.
  */

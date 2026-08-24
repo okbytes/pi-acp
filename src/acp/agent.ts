@@ -42,7 +42,13 @@ import {
 } from './translate/bash.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
-import { getAcpModelFilter, getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
+import {
+  getAcpModelFilter,
+  getAgentDir,
+  getEnableSkillCommands,
+  getQuietStartup,
+  getUpdateNoticeEnabled
+} from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
@@ -362,7 +368,7 @@ export class PiAcpAgent implements ACPAgent {
     })
 
     const quietStartup = getQuietStartup(params.cwd)
-    const updateNotice = buildUpdateNotice()
+    const updateNotice = getUpdateNoticeEnabled(params.cwd) ? buildUpdateNotice() : null
 
     // If quietStartup is enabled, suppress the full "startup info" prelude, but still surface
     // the "New version available" notice (if any) since it's high-signal and actionable.
