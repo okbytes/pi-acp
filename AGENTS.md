@@ -68,6 +68,10 @@ For real validation, test with an ACP client (e.g. Zed external agent).
 ## Source control
 
 - **DO NOT** commit unless explicitly asked!
+- When asked, **commit straight to `main` and push to `origin`.** This is a consumer fork (see
+  below): `main` is the line Zed runs, and there is nothing to review a PR against. Do not create
+  a topic branch, do not open a PR, and do not flag the direct-to-`main` push as a caveat — the
+  only time a branch is right is when the change is being sent upstream to `svkozak/pi-acp`.
 
 ## This checkout is a patched fork
 
@@ -76,7 +80,8 @@ use in Zed. It is a _consumer_ fork, not a contributor fork, so the convention i
 from the usual advice:
 
 - **`main` is the patched line that Zed actually runs.** Local fixes land as ordinary commits
-  on `main`. There is no "which branch is the real one?" question.
+  pushed directly to `main`. No branch, no PR, no review — those exist to coordinate between
+  people, and this line has one consumer. There is no "which branch is the real one?" question.
 - Upstream is a remote, not a branch to defend.
 
 ```
@@ -133,6 +138,10 @@ gh pr create --repo svkozak/pi-acp --head okbytes:fix/whatever
   `acp.hideModels`/`acp.showModels` + `PI_ACP_HIDE_MODELS`/`PI_ACP_SHOW_MODELS`
   (`buildConfigOptions`/`getModelState` in `src/acp/agent.ts`, `getAcpModelFilter` in
   `src/acp/pi-settings.ts`).
+- **Opt-in update notice** — the "New version available" prelude is off unless
+  `acp.updateNotice` / `PI_ACP_UPDATE_NOTICE=true` asks for it; npm has the version before the
+  local installer can fetch it, and emitting it as the first agent message pins Zed's thread
+  title to "New Agent Thread" (`getUpdateNoticeEnabled` in `src/acp/pi-settings.ts`).
 
 Rebase conflicts, when they happen, are almost always in `getModelState`/`buildConfigOptions`
 in `src/acp/agent.ts` or the pi-event `switch` in `src/acp/session.ts` — the same two hot spots
