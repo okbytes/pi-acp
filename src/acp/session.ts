@@ -11,7 +11,7 @@ import type {
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
-import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import { PiRpcProcess, PiRpcSpawnError, type PiExitInfo, type PiRpcEvent } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
@@ -353,6 +353,34 @@ export class PiAcpSession {
     this.fileCommands = opts.fileCommands ?? []
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
+    this.proc.onExit(info => this.handlePiExit(info))
+  }
+
+  private handlePiExit(info: PiExitInfo): void {
+    this.inAgentLoop = false
+
+    const interrupted = this.pendingTurn
+    const abandoned = this.turnQueue.splice(0, this.turnQueue.length)
+    this.pendingTurn = null
+    if (!interrupted && abandoned.length === 0) return
+
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: {
+        type: 'text',
+        text: `pi exited before the turn finished (code=${info.code}, signal=${info.signal}). Send the message again to start a new pi process.`
+      }
+    })
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { queueDepth: 0, running: false } }
+    })
+
+    const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
+    void this.flushEmits().finally(() => {
+      interrupted?.resolve(reason)
+      for (const t of abandoned) t.resolve(reason)
+    })
   }
 
   setStartupInfo(text: string) {

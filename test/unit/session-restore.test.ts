@@ -48,7 +48,8 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
   ;(PiRpcProcess as any).spawn = async (params: any) => {
     spawnCalls.push(params)
     return {
-      onEvent: () => () => {}
+      onEvent: () => () => {},
+      onExit: () => () => {}
     } as any
   }
 
@@ -137,6 +138,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
     spawnCalls.push(params)
     return {
       onEvent: () => () => {},
+      onExit: () => () => {},
       getAvailableModels: async () => ({
         models: [
           { provider: 'test', id: 'alpha', name: 'Alpha' },
@@ -214,7 +216,8 @@ test('PiAcpAgent: cancel ignores stale session IDs without spawning a restore pr
   ;(PiRpcProcess as any).spawn = async (params: any) => {
     spawnCalls.push(params)
     return {
-      onEvent: () => () => {}
+      onEvent: () => () => {},
+      onExit: () => () => {}
     } as any
   }
 

@@ -80,6 +80,26 @@ test('PiAcpSession: a prompt pi rejects while busy is retried instead of dropped
   assert.equal(await turn, 'end_turn')
 })
 
+test('PiAcpSession: pi dying mid-turn ends the turn instead of leaving it open', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = createSession(proc, conn)
+
+  const turn = session.prompt('long running work')
+  const queued = session.prompt('next one')
+  proc.emit({ type: 'agent_start' })
+
+  proc.emitExit({ code: 1, signal: null })
+
+  assert.equal(await turn, 'error')
+  assert.equal(await queued, 'error')
+
+  const texts = conn.updates
+    .map(u => (u as any).update?.content?.text)
+    .filter((t): t is string => typeof t === 'string')
+  assert.ok(texts.some(t => /pi exited before the turn finished/.test(t)))
+})
+
 test('PiAcpSession: a queued prompt still runs after the turn ahead of it finishes', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
