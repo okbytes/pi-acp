@@ -72,7 +72,12 @@ test('PiAcpSession: names the streamed card and keeps pi execution on the same c
       toolCall: { type: 'toolCall', id: 'toolu_vrtx_01', name: 'write', arguments: { path: 'poem.md', content } }
     })
   )
-  proc.emit({ type: 'tool_execution_start', toolCallId: 'toolu_vrtx_01', toolName: 'write', args: { path: 'poem.md', content } })
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'toolu_vrtx_01',
+    toolName: 'write',
+    args: { path: 'poem.md', content }
+  })
   proc.emit({
     type: 'tool_execution_end',
     toolCallId: 'toolu_vrtx_01',
@@ -147,7 +152,9 @@ test('PiAcpSession: fails a streamed card abandoned when the message ends', asyn
   const { conn, proc } = newSession(mkdtempSync(join(tmpdir(), 'pi-acp-abandon-')))
 
   proc.emit(toolEvent({ type: 'toolcall_start', contentIndex: 0 }))
-  proc.emit(toolEvent({ type: 'toolcall_delta', contentIndex: 0, delta: `{"path": "a.txt", "content": "${'x'.repeat(600)}` }))
+  proc.emit(
+    toolEvent({ type: 'toolcall_delta', contentIndex: 0, delta: `{"path": "a.txt", "content": "${'x'.repeat(600)}` })
+  )
   proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'aborted' } })
   await settle()
 
@@ -163,8 +170,12 @@ test('PiAcpSession: tracks two tool calls streaming in one message', async () =>
 
   proc.emit(toolEvent({ type: 'toolcall_start', contentIndex: 0 }))
   proc.emit(toolEvent({ type: 'toolcall_start', contentIndex: 1 }))
-  proc.emit(toolEvent({ type: 'toolcall_delta', contentIndex: 0, delta: `{"path": "one.md", "content": "${'x'.repeat(600)}` }))
-  proc.emit(toolEvent({ type: 'toolcall_delta', contentIndex: 1, delta: `{"path": "two.md", "content": "${'y'.repeat(600)}` }))
+  proc.emit(
+    toolEvent({ type: 'toolcall_delta', contentIndex: 0, delta: `{"path": "one.md", "content": "${'x'.repeat(600)}` })
+  )
+  proc.emit(
+    toolEvent({ type: 'toolcall_delta', contentIndex: 1, delta: `{"path": "two.md", "content": "${'y'.repeat(600)}` })
+  )
   await settle()
 
   const updates = conn.updates.map(u => u.update as any)
