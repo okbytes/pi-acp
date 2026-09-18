@@ -142,10 +142,21 @@ gh pr create --repo svkozak/pi-acp --head okbytes:fix/whatever
   `acp.updateNotice` / `PI_ACP_UPDATE_NOTICE=true` asks for it; npm has the version before the
   local installer can fetch it, and emitting it as the first agent message pins Zed's thread
   title to "New Agent Thread" (`getUpdateNoticeEnabled` in `src/acp/pi-settings.ts`).
+- **Prompt gating on pi's own turns** — a pi extension can start a turn the adapter never asked
+  for (`pi.sendUserMessage`/`pi.sendMessage`, as `continue-after-compaction` does after every
+  compaction). Gating only on `pendingTurn` let the next user prompt reach pi mid-turn, where pi
+  answers `success:false, "Agent is already processing"` and the message was silently dropped
+  while the ACP turn resolved `end_turn`. Prompts now gate on `piIsBusy()` and a busy rejection
+  is requeued rather than resolved away (`piIsBusy`/`drainQueue`/`requeueRejectedTurn` in
+  `src/acp/session.ts`).
+- **Turn ends when pi dies** — `PiRpcProcess` only rejected in-flight RPC requests on child exit,
+  and the prompt RPC resolves at acceptance, so a pi that died mid-turn left `session/prompt`
+  open forever. The process now reports its exit and the session ends the turn with a notice
+  (`PiRpcProcess.onExit` in `src/pi-rpc/process.ts`, `Session.handlePiExit`).
 
 Rebase conflicts, when they happen, are almost always in `getModelState`/`buildConfigOptions`
-in `src/acp/agent.ts` or the pi-event `switch` in `src/acp/session.ts` — the same two hot spots
-upstream edits.
+in `src/acp/agent.ts`, the pi-event `switch` in `src/acp/session.ts`, or the `prompt`/`startTurn`
+pair next to it — the hot spots upstream edits.
 
 ## Client information
 
