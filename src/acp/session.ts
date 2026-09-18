@@ -73,6 +73,13 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+const BUSY_REQUEUE_RETRY_MS = 250
+const AGENT_BUSY_PATTERN = /already processing/i
+
+function isAgentBusyError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '')
+  return AGENT_BUSY_PATTERN.test(message)
+}
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
@@ -376,7 +383,7 @@ export class PiAcpSession {
       const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
 
       // If a turn is already running, enqueue.
-      if (this.pendingTurn) {
+      if (this.piIsBusy()) {
         this.turnQueue.push(queued)
 
         // Best-effort: notify client that a prompt was queued.
@@ -606,11 +613,50 @@ export class PiAcpSession {
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
+  private piIsBusy(): boolean {
+    return this.pendingTurn !== null || this.inAgentLoop
+  }
+
+  private requeueRejectedTurn(t: QueuedTurn, turnRef: PendingTurn): void {
+    if (this.pendingTurn === turnRef) this.pendingTurn = null
+    this.turnQueue.unshift(t)
+
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
+    })
+
+    setTimeout(() => this.drainQueue(false), BUSY_REQUEUE_RETRY_MS).unref?.()
+  }
+
+  private drainQueue(announce: boolean): void {
+    if (this.pendingTurn) return
+
+    const next = this.turnQueue.shift()
+    if (!next) {
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: 0, running: false } }
+      })
+      return
+    }
+
+    if (announce) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+      })
+    }
+
+    this.startTurn(next)
+  }
+
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
 
-    this.pendingTurn = { resolve: t.resolve, reject: t.reject }
+    const turnRef: PendingTurn = { resolve: t.resolve, reject: t.reject }
+    this.pendingTurn = turnRef
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -622,19 +668,24 @@ export class PiAcpSession {
     // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
     // continuations may emit multiple `agent_end` events before `agent_settled`.
     this.proc.prompt(t.message, t.images).catch(err => {
+      if (isAgentBusyError(err)) {
+        this.requeueRejectedTurn(t, turnRef)
+        return
+      }
+
       // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
       // Also ensure we flush any already-enqueued updates first.
       void this.flushEmits().finally(() => {
         // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
         const authErr = maybeAuthRequiredError(err)
         if (authErr) {
-          this.pendingTurn?.reject(authErr)
+          turnRef.reject(authErr)
         } else {
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
+          turnRef.resolve(reason)
         }
 
-        this.pendingTurn = null
+        if (this.pendingTurn === turnRef) this.pendingTurn = null
         this.inAgentLoop = false
 
         // If the prompt failed, do not automatically proceed—pi may be unhealthy.
@@ -1020,19 +1071,7 @@ export class PiAcpSession {
             this.inAgentLoop = false
 
             // Start next queued prompt, if any.
-            const next = this.turnQueue.shift()
-            if (next) {
-              this.emit({
-                sessionUpdate: 'agent_message_chunk',
-                content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-              })
-              this.startTurn(next)
-            } else {
-              this.emit({
-                sessionUpdate: 'session_info_update',
-                _meta: { piAcp: { queueDepth: 0, running: false } }
-              })
-            }
+            this.drainQueue(true)
           })
         })
         break
